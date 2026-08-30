@@ -1,0 +1,23 @@
+# Ignore entire data and database directories
+data/*
+db/
+
+# Keep folder structures in Git via .gitkeep
+!data/**/.gitkeep
+!db/**/.gitkeep
+
+# Ignore standalone SQLite/database files anywhere in the project
+*.db
+*.sqlite
+*.sqlite3
+
+# Python environments and cache
+__pycache__/
+*.py[cod]
+(sheffield_rag)/
+venv/
+.venv/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
