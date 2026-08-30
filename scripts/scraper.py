@@ -1,4 +1,5 @@
-# scrapes data online for sheffield lake minutes
+# this scrapes a word press website and downloads pdfs based
+# on id values given to the script.  It's not great but it works.
 import os
 import re
 import requests
@@ -10,16 +11,17 @@ from pathlib import Path
 # Suppress BS4 XML parsing warnings
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-# Setup Paths
+# Paths relative to script location
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 DOWNLOAD_DIR = PROJECT_ROOT / "data" / "raw_pdfs"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# Full list of meeting minute years
 TARGET_PAGES = [
     "https://www.sheffieldlake.net/city-departments/council/2008-minutes/",
     "https://www.sheffieldlake.net/city-departments/council/2009-minutes/",
-    "https://www.sheffieldlake.net/city-departments/council/meeting-minutes/",
+    "https://www.sheffieldlake.net/city-departments/council/meeting-minutes/", # 2010
     "https://www.sheffieldlake.net/city-departments/council/2011-minutes/",
     "https://www.sheffieldlake.net/city-departments/council/2012-minutes/",
     "https://www.sheffieldlake.net/city-departments/council/2013-minutes/",
@@ -42,138 +44,197 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-MEETING_KEYWORDS = [
-    "council", "minutes", "worksession", "committee", "agenda",
-    "roads", "drains", "buildings", "lands", "finance", "safety", 
-    "ordinance", "planning", "zba", "park", "hearing", "resolution"
-]
-
 IGNORE_TERMS = [
     "permit", "application", "contractor", "zoning-map", "banner",
     "food-truck", "backflow", "water-quality", "pws", "sewer-credit", 
-    "pos-form", "master-plan", "vr_form", "history", "agreement", "rental",
-    "ai1ec", "all-in-one-event-calendar", "feed", "plugin="
+    "pos-form", "pos", "point-of-sale", "master-plan", "vr_form", 
+    "agreement", "rental", "park-rental", "driveway", "pavilion"
 ]
 
-def get_soup(url):
+NON_DOCUMENT_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.zip', '.docx', '.xlsx', '.css', '.js')
+
+
+def get_pdf_from_wp_id(attachment_id, cache):
+    """Asks the WP REST API for the direct media source URL using its attachment ID."""
+    if attachment_id in cache:
+        return cache[attachment_id]
+
+    api_url = f"https://www.sheffieldlake.net/wp-json/wp/v2/media/{attachment_id}"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        return BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        print(f"    [!] Error fetching page {url}: {e}")
-        return None
+        r = requests.get(api_url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            source_url = data.get("source_url")
+            if source_url and ".pdf" in source_url.lower():
+                cache[attachment_id] = source_url
+                return source_url
+    except Exception:
+        pass
 
-def is_valid_meeting_pdf(pdf_url):
-    parsed = urlparse(pdf_url)
-    if "sheffieldlake.net" not in parsed.netloc:
-        return False
-
-    url_lower = pdf_url.lower()
-    if any(term in url_lower for term in IGNORE_TERMS):
-        return False
-    if any(keyword in url_lower for keyword in MEETING_KEYWORDS):
-        return True
-    return False
-
-def extract_pdf_from_url(target_url):
-    clean_target = target_url.split('#')[0].rstrip('/')
-    
-    # Strictly require http or https protocols
-    if not clean_target.startswith(("http://", "https://")):
-        return None
-
-    # Fast path: If direct PDF link, validate without extra web request
-    if clean_target.lower().endswith(".pdf"):
-        if is_valid_meeting_pdf(clean_target):
-            return clean_target
-        return None
-
-    parsed = urlparse(clean_target)
-    path_lower = parsed.path.lower()
-    query_lower = parsed.query.lower()
-
-    if "sheffieldlake.net" in parsed.netloc:
-        if any(term in path_lower or term in query_lower for term in IGNORE_TERMS):
-            return None
-        
-        # Only inspect subpages containing numbers (dates) or meeting keywords in path
-        if not (re.search(r'\d', path_lower) or any(k in path_lower for k in MEETING_KEYWORDS)):
-            return None
-
-        soup = get_soup(clean_target)
-        if not soup:
-            return None
-        
-        for elem in soup.find_all(["a", "iframe", "embed"]):
-            raw_href = elem.get("href") or elem.get("src")
-            if raw_href:
-                raw_href_clean = raw_href.strip()
-                if raw_href_clean.lower().endswith(".pdf"):
-                    full_pdf = urljoin(clean_target, raw_href_clean)
-                    if full_pdf.startswith(("http://", "https://")) and is_valid_meeting_pdf(full_pdf):
-                        return full_pdf
-                
+    cache[attachment_id] = None
     return None
 
-def extract_and_download_pdfs(subpage_urls):
+
+def download_pdf(pdf_url, processed_pdf_urls):
+    """Downloads the PDF to the local raw_pdfs folder."""
+    parsed = urlparse(pdf_url)
+    if "sheffieldlake.net" not in parsed.netloc:
+        return False, "external"
+        
+    url_lower = pdf_url.lower()
+    if any(term in url_lower for term in IGNORE_TERMS):
+        return False, "ignored"
+
+    if pdf_url in processed_pdf_urls:
+        return False, "duplicate"
+
+    processed_pdf_urls.add(pdf_url)
+
+    filename = Path(parsed.path).name
+    filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', filename)
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
+
+    local_path = DOWNLOAD_DIR / filename
+
+    if local_path.exists():
+        return False, "exists"
+
+    try:
+        r = requests.get(pdf_url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+
+        # Reject HTML response pages
+        if len(r.content) < 100 or b"<!DOCTYPE" in r.content[:200] or b"<html" in r.content[:200].lower():
+            return False, "not_a_pdf"
+
+        print(f"  [+] DOWNLOADING: {filename}")
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+        return True, "downloaded"
+    except Exception as e:
+        print(f"  [!] Failed {pdf_url}: {e}")
+        return False, "error"
+
+
+def extract_pdfs_from_html(html_content, base_url):
+    """Extracts direct PDF URLs and relative wp-content/uploads/ paths from HTML."""
+    found_urls = set()
+
+    soup = BeautifulSoup(html_content, "html.parser")
+    for tag in soup.find_all(["a", "iframe", "embed", "object", "meta"]):
+        for attr in ["href", "src", "data", "content"]:
+            val = tag.get(attr)
+            if not val:
+                continue
+            
+            clean_val = val.replace('\\/', '/')
+            full_url = urljoin(base_url, clean_val)
+            full_lower = full_url.lower()
+
+            if ".pdf" in full_lower or "/wp-content/uploads/" in full_lower:
+                if not any(full_lower.endswith(ext) for ext in NON_DOCUMENT_EXTS):
+                    found_urls.add(full_url)
+
+    # Regex fallback for explicit PDF URLs
+    matches = re.findall(r'(https?:\\?/\\?/[^\s\'"<>]+?\.pdf(?:\?[^\s\'"<>]*)?)', html_content, re.IGNORECASE)
+    for m in matches:
+        clean = m.replace('\\/', '/')
+        found_urls.add(urljoin(base_url, clean))
+
+    return found_urls
+
+
+def scrape_all():
     downloaded_count = 0
     skipped_count = 0
     processed_pdf_urls = set()
+    id_cache = {}
+    visited_subpages = set()
 
-    for idx, page_url in enumerate(subpage_urls, start=1):
-        print(f"[{idx}/{len(subpage_urls)}] Scanning landing page: {page_url}")
-        soup = get_soup(page_url)
-        if not soup:
+    print(f"[+] Scraping {len(TARGET_PAGES)} yearly landing pages...\n")
+
+    for idx, landing_url in enumerate(TARGET_PAGES, start=1):
+        print(f"[{idx}/{len(TARGET_PAGES)}] Scanning: {landing_url}")
+        try:
+            r = requests.get(landing_url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                print(f"  [!] Failed to load page ({r.status_code})")
+                continue
+            html_content = r.text
+        except Exception as e:
+            print(f"  [!] Exception fetching {landing_url}: {e}")
             continue
 
-        candidate_links = []
+        soup = BeautifulSoup(html_content, "html.parser")
+        unresolved_subpages = set()
+
+        # Step 1: Parse all anchor tags on the landing page
         for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if not href or href.startswith(("javascript:", "mailto:", "webcal:")):
-                continue
-            full_url = urljoin(page_url, href)
-            
-            if full_url.startswith(("http://", "https://")) and "sheffieldlake.net" in urlparse(full_url).netloc:
-                candidate_links.append(full_url)
+            href = urljoin(landing_url, a["href"]).split('#')[0]
+            parsed_href = urlparse(href)
 
-        for link_url in candidate_links:
-            pdf_url = extract_pdf_from_url(link_url)
-            
-            if not pdf_url or pdf_url in processed_pdf_urls:
+            if "sheffieldlake.net" not in parsed_href.netloc:
                 continue
 
-            processed_pdf_urls.add(pdf_url)
-
-            clean_pdf_url = re.sub(r'^(https?://)+', 'https://', pdf_url, flags=re.IGNORECASE)
-            filename = Path(urlparse(clean_pdf_url).path).name
-            filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', filename)
-            
-            if not filename.lower().endswith(".pdf"):
-                filename += ".pdf"
-
-            local_path = DOWNLOAD_DIR / filename
-
-            if local_path.exists():
-                skipped_count += 1
+            # Case A: Direct .PDF link
+            if href.lower().endswith(".pdf"):
+                success, reason = download_pdf(href, processed_pdf_urls)
+                if success:
+                    downloaded_count += 1
+                elif reason == "exists":
+                    skipped_count += 1
                 continue
 
-            print(f"    [->] Downloading: {filename}")
+            # Case B: Look for WordPress Attachment ID in rel or class attributes
+            rel_attr = a.get("rel", [])
+            rel_str = " ".join(rel_attr) if isinstance(rel_attr, list) else str(rel_attr)
+            class_attr = a.get("class", [])
+            class_str = " ".join(class_attr) if isinstance(class_attr, list) else str(class_attr)
+            
+            combined_attrs = f"{rel_str} {class_str}"
+            att_match = re.search(r'wp-att-(\d+)', combined_attrs)
+
+            if att_match:
+                att_id = att_match.group(1)
+                direct_pdf = get_pdf_from_wp_id(att_id, id_cache)
+                if direct_pdf:
+                    success, reason = download_pdf(direct_pdf, processed_pdf_urls)
+                    if success:
+                        downloaded_count += 1
+                    elif reason == "exists":
+                        skipped_count += 1
+                    continue
+
+            # Case C: Collect subpage URL for fallback HTML crawling
+            if not href.lower().endswith(NON_DOCUMENT_EXTS):
+                landing_path = parsed_href.path.rstrip('/')
+                if landing_path and landing_path != urlparse(landing_url).path.rstrip('/'):
+                    unresolved_subpages.add(href)
+
+        # Step 2: Fallback HTML crawling for links that had no attachment ID
+        for sub_url in unresolved_subpages:
+            if sub_url in visited_subpages:
+                continue
+
+            visited_subpages.add(sub_url)
             try:
-                r = requests.get(clean_pdf_url, headers=HEADERS, timeout=20)
-                r.raise_for_status()
-                with open(local_path, "wb") as f:
-                    f.write(r.content)
-                downloaded_count += 1
-            except Exception as e:
-                print(f"    [!] Failed to download {clean_pdf_url}: {e}")
+                sub_r = requests.get(sub_url, headers=HEADERS, timeout=10)
+                if sub_r.status_code == 200:
+                    sub_pdfs = extract_pdfs_from_html(sub_r.text, sub_url)
+                    for pdf_url in sub_pdfs:
+                        success, reason = download_pdf(pdf_url, processed_pdf_urls)
+                        if success:
+                            downloaded_count += 1
+                        elif reason == "exists":
+                            skipped_count += 1
+            except Exception:
+                pass
 
-    print(f"\nScraping complete!")
+    print(f"\n==========================================")
+    print(f"Full Site Sync Complete!")
     print(f"New Downloads: {downloaded_count} | Already Existing: {skipped_count}")
 
-def main():
-    print(f"[+] Direct scanning {len(TARGET_PAGES)} hand-verified landing pages...\n")
-    extract_and_download_pdfs(TARGET_PAGES)
 
 if __name__ == "__main__":
-    main()
+    scrape_all()
