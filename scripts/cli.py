@@ -1,5 +1,14 @@
-# Interactive Text-to-SQL CLI for Sheffield Lake Municipal Records (2008–2026)
+# Interactive Text-to-SQL + RAG Hybrid CLI for Sheffield Lake Municipal Records (2008–2026)
+
+import os
+import certifi
+
+# Fix SSL / Hugging Face cache lookup issue on Windows
+os.environ["SSL_CERT_FILE"] = certifi.where()
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
 import json
+import re
 import sqlite3
 import sys
 import textwrap
@@ -7,15 +16,123 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Optional vector search dependencies (graceful fallback if not installed/indexed yet)
+try:
+    import numpy as np
+    from sentence_transformers import SentenceTransformer
+    import faiss
+    HAS_VECTOR_LIBS = True
+except ImportError:
+    HAS_VECTOR_LIBS = False
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 DB_PATH = PROJECT_ROOT / "db" / "sheffield_lake_rag.db"
+VECTOR_INDEX_PATH = PROJECT_ROOT / "db" / "faiss_index.bin"
+VECTOR_METADATA_PATH = PROJECT_ROOT / "db" / "vector_metadata.json"
 
 
 class SheffieldSQLChain:
 
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
+        self.embedder = None
+        self.vector_index = None
+        self.vector_metadata = []
+
+        # Initialize vector store if available
+        if HAS_VECTOR_LIBS and VECTOR_INDEX_PATH.exists() and VECTOR_METADATA_PATH.exists():
+            try:
+                self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+                self.vector_index = faiss.read_index(str(VECTOR_INDEX_PATH))
+                with open(VECTOR_METADATA_PATH, "r", encoding="utf-8") as f:
+                    self.vector_metadata = json.load(f)
+            except Exception as e:
+                print(f"[Warning: Could not load vector index]: {e}")
+
+    def retrieve_vector_chunks(
+        self,
+        query: str,
+        top_k: int = 5,
+        start_year: int = None,
+        end_year: int = None,
+        oversample_factor: int = 5,
+    ):
+        """Retrieves semantically relevant unstructured text chunks using FAISS,
+
+        applying post-filtering metadata checks for active CLI year ranges.
+        """
+        if not (self.embedder and self.vector_index and self.vector_metadata):
+            return []
+
+        try:
+            has_year_filter = start_year is not None or end_year is not None
+            fetch_k = top_k * oversample_factor if has_year_filter else top_k
+
+            query_vector = self.embedder.encode([query]).astype("float32")
+            distances, indices = self.vector_index.search(query_vector, fetch_k)
+
+            candidate_chunks = []
+            rowids_to_lookup = []
+
+            for idx in indices[0]:
+                if 0 <= idx < len(self.vector_metadata):
+                    meta = self.vector_metadata[idx]
+                    candidate_chunks.append(meta)
+                    # Track rowid or id for SQLite metadata fallback if year is missing in JSON
+                    if isinstance(meta, dict) and "rowid" in meta:
+                        rowids_to_lookup.append(meta["rowid"])
+
+            # Map SQLite meeting dates if vector metadata doesn't contain explicit parsed years
+            db_date_map = {}
+            if rowids_to_lookup and self.db_path.exists():
+                placeholders = ",".join("?" for _ in rowids_to_lookup)
+                sql = f"SELECT rowid, meeting_date FROM meetings WHERE rowid IN ({placeholders})"
+                try:
+                    with sqlite3.connect(self.db_path) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(sql, rowids_to_lookup)
+                        for r_id, m_date in cursor.fetchall():
+                            db_date_map[r_id] = m_date
+                except Exception:
+                    pass
+
+            filtered_results = []
+            for chunk in candidate_chunks:
+                # Resolve date string from chunk dict or SQLite fallback
+                meeting_date = None
+                if isinstance(chunk, dict):
+                    meeting_date = chunk.get("meeting_date") or chunk.get("date")
+                    if not meeting_date and "rowid" in chunk:
+                        meeting_date = db_date_map.get(chunk["rowid"])
+                elif isinstance(chunk, str):
+                    match = re.search(r"\b(19|20)\d{2}\b", chunk)
+                    if match:
+                        meeting_date = match.group(0)
+
+                # Parse numeric year
+                parsed_year = None
+                if meeting_date:
+                    year_match = re.search(r"\b(19|20)\d{2}\b", str(meeting_date))
+                    if year_match:
+                        parsed_year = int(year_match.group(0))
+
+                # Apply post-filtering criteria
+                if parsed_year is not None:
+                    if start_year and parsed_year < start_year:
+                        continue
+                    if end_year and parsed_year > end_year:
+                        continue
+
+                filtered_results.append(chunk)
+
+                if len(filtered_results) == top_k:
+                    break
+
+            return filtered_results
+        except Exception as e:
+            print(f"\n[Warning: Vector retrieval failed]: {e}")
+            return []
 
     def get_all_distinct_issues(self):
         if not self.db_path.exists():
@@ -82,12 +199,16 @@ class SheffieldSQLChain:
         """
         params = []
 
-        if start_year:
-            sql += " AND m.meeting_date LIKE ?"
-            params.append(f"%{start_year}%")
-        if end_year:
-            sql += " AND m.meeting_date LIKE ?"
-            params.append(f"%{end_year}%")
+        if start_year and end_year:
+            sql += " AND CAST(strftime('%Y', m.meeting_date) AS INTEGER) BETWEEN ? AND ?"
+            params.extend([start_year, end_year])
+        elif start_year:
+            sql += " AND CAST(strftime('%Y', m.meeting_date) AS INTEGER) >= ?"
+            params.append(start_year)
+        elif end_year:
+            sql += " AND CAST(strftime('%Y', m.meeting_date) AS INTEGER) <= ?"
+            params.append(end_year)
+
         if category_filter:
             sql += " AND m.category LIKE ?"
             params.append(f"%{category_filter}%")
@@ -107,15 +228,14 @@ class SheffieldSQLChain:
 
     def generate_sql_query(self, user_query: str, limit: int = 20, start_year: int = None, end_year: int = None, category_filter: str = None, model_name: str = "llama3") -> str:
         """Uses Ollama to translate natural language into a single executable SQL query."""
-        import json
-        import re
-        import urllib.request
-
         filter_context = []
         if start_year and end_year:
             filter_context.append(f"m.meeting_date BETWEEN '{start_year}-01-01' AND '{end_year}-12-31'")
         elif start_year:
             filter_context.append(f"m.meeting_date >= '{start_year}-01-01'")
+        elif end_year:
+            filter_context.append(f"m.meeting_date <= '{end_year}-12-31'")
+
         if category_filter:
             filter_context.append(f"m.category LIKE '%{category_filter}%'")
 
@@ -130,15 +250,12 @@ DATABASE SCHEMA:
 
 CRITICAL SQL & FTS5 RULES:
 1. Always JOIN using: `FROM meetings m JOIN meetings_fts fts ON m.rowid = fts.rowid`
-2. NEVER combine `MATCH` and `LIKE` in the same WHERE clause with `OR`.
-3. For general keyword searches across text:
-   Use `WHERE meetings_fts MATCH 'term*'`
-4. For listing/ranking TOPICS by category or term (e.g. "List topics about infrastructure"):
-   Use `WHERE fts.issue_type LIKE '%infrastructure%' OR fts.topic_name LIKE '%infrastructure%'`
-   Always GROUP BY and ORDER BY frequency:
-   `SELECT fts.topic_name, fts.issue_type, COUNT(DISTINCT m.meeting_id) AS meeting_count FROM meetings m JOIN meetings_fts fts ON m.rowid = fts.rowid WHERE fts.issue_type LIKE '%infrastructure%' GROUP BY fts.topic_name ORDER BY meeting_count DESC`
-5. For counts, use: `SELECT COUNT(DISTINCT m.meeting_id) AS total_meetings`
-6. Active constraints: {filter_clause if filter_clause else 'None'}
+2. For FTS full-text searches, match on the virtual table directly: `meetings_fts MATCH 'term*'`
+   NEVER write column-level match like `fts.topic_name MATCH`. Use `meetings_fts MATCH 'term*'` or `LIKE '%term%'`.
+3. Wrap multiple OR search predicates in explicit parentheses when combining with AND/date constraints:
+   Example: `WHERE (fts.topic_name LIKE '%barking%' OR fts.description LIKE '%barking%'){filter_clause}`
+4. Active date/category constraints (ALWAYS include these if non-empty): {filter_clause if filter_clause else 'None'}
+5. Always include `LIMIT {limit}` at the end of the query to constrain results.
 
 Output ONLY raw executable SQL starting with SELECT or WITH. Do NOT include markdown backticks or prose.
 
@@ -167,17 +284,15 @@ SQLite Query:"""
                     else:
                         sql_str = raw_text.strip()
 
-                # Truncate trailing text after semicolon
                 if ";" in sql_str:
                     sql_str = sql_str.split(";")[0]
 
-                # Strip trailing quotes, backticks, or trailing prose whitespace
                 sql_str = sql_str.rstrip("`'\" ").strip()
 
-                # Post-processing fix: catch and replace 'fts MATCH' if Llama leaks it
+                # Fix FTS match syntax errors generated by models
+                sql_str = re.sub(r"\bfts\.\w+\s+MATCH\b", "meetings_fts MATCH", sql_str, flags=re.IGNORECASE)
                 sql_str = re.sub(r"\bfts\s+MATCH\b", "meetings_fts MATCH", sql_str, flags=re.IGNORECASE)
 
-                # Safety check for unbalanced single quotes in generated MATCH strings
                 if sql_str.count("'") % 2 != 0:
                     sql_str += "'"
 
@@ -191,7 +306,6 @@ SQLite Query:"""
         if not self.db_path.exists() or not sql_query:
             return None, []
 
-        # Fix unclosed trailing single quote in MATCH clauses
         if sql_query.count("'") % 2 != 0:
             sql_query += "'"
 
@@ -207,25 +321,30 @@ SQLite Query:"""
                 print(f"\n[SQLite Execution Error]: {e}")
                 return None, []
 
-    def synthesize_answer(self, user_query: str, sql_query: str, col_names: list, rows: list, model_name: str = "llama3"):
+    def synthesize_answer(self, user_query: str, sql_query: str, col_names: list, rows: list, vector_chunks: list = None, model_name: str = "llama3"):
         results_preview = []
-        for r in rows[:20]:
+        for r in (rows or [])[:20]:
             row_dict = {col: r[col] for col in col_names}
             results_preview.append(str(row_dict))
 
-        data_str = "\n".join(results_preview)
-        total_rows = len(rows)
+        data_str = "\n".join(results_preview) if results_preview else "No matching structured SQL rows returned."
+        total_rows = len(rows) if rows else 0
+
+        vector_context_str = ""
+        if vector_chunks:
+            chunk_texts = [f"- {c.get('text', str(c)) if isinstance(c, dict) else str(c)}" for c in vector_chunks]
+            vector_context_str = "\n\nRetrieved Unstructured Vector Context (RAG):\n" + "\n".join(chunk_texts)
 
         prompt = f"""You are an expert municipal analyst for the City of Sheffield Lake.
-Answer the user's question directly based on the database execution results below.
+Answer the user's question directly based on the provided SQL query results and retrieved unstructured vector context.
 
 Executed SQL Query:
 {sql_query}
 
-Total Rows Returned: {total_rows}
+Showing top {len(results_preview)} rows (out of {total_rows} total matching records):
 
 SQL Query Result Data:
-{data_str}
+{data_str}{vector_context_str}
 
 User Question: {user_query}
 
@@ -249,8 +368,8 @@ Answer:"""
 
 def print_banner():
     print("\n" + "=" * 65)
-    print("   CITY OF SHEFFIELD LAKE - TEXT-TO-SQL ENGINE")
-    print("   Database: SQLite + FTS5 | Years: 2008–2026")
+    print("   CITY OF SHEFFIELD LAKE - TEXT-TO-SQL + RAG ENGINE")
+    print("   Database: SQLite + FTS5 + FAISS Vector Index | Years: 2008–2026")
     print("=" * 65)
     print(" Commands:")
     print("   /top [N]                  - Get top N overall issues via SQL count")
@@ -415,13 +534,14 @@ def run_cli():
                     Active Category Filter : {cat_str}
                     Result Limit (/chunks) : {n_results}
                     Ollama Model           : {model_name}
+                    Vector Index Loaded    : {'Yes' if sql_chain.vector_index else 'No (SQL only)'}
                     ===================================================================
                     """
                 print(textwrap.dedent(status_output).strip())
                 print()
                 continue
 
-            # Pure Text-to-SQL Execution: LLM generates raw SQL across the ENTIRE database
+            # Hybrid Execution Step 1: Text-to-SQL + Vector Search Concurrent Execution
             start_time = time.perf_counter()
             sql_query = sql_chain.generate_sql_query(
                 user_query=user_input,
@@ -432,19 +552,39 @@ def run_cli():
                 model_name=model_name,
             )
 
-            if not sql_query:
-                print(">>> Could not generate SQL query.\n")
-                continue
+            col_names, rows = [], []
+            if sql_query:
+                print(f"\n[Generated SQL]: {sql_query}")
+                col_names, rows = sql_chain.execute_sql(sql_query)
+            else:
+                print(">>> Could not generate SQL query; falling back entirely to vector search.\n")
 
-            print(f"\n[Generated SQL]: {sql_query}")
-            col_names, rows = sql_chain.execute_sql(sql_query)
+            # Always-On Vector Search Retrieval with active year post-filtering
+            vector_chunks = sql_chain.retrieve_vector_chunks(
+                query=user_input,
+                top_k=n_results,
+                start_year=start_year,
+                end_year=end_year,
+            )
+
             elapsed_ms = (time.perf_counter() - start_time) * 1000
 
-            print(f"[Executed against entire DB in {elapsed_ms:.2f} ms | Returned {len(rows)} row(s)]")
+            year_filter_str = f" (Filtered: {start_year or 'Min'}–{end_year or 'Max'})" if (start_year or end_year) else ""
+            print(f"[Executed in {elapsed_ms:.2f} ms | Returned {len(rows or [])} SQL row(s) & {len(vector_chunks)} vector chunk(s){year_filter_str}]")
             print("-" * 65)
 
-            if rows is not None:
-                sql_chain.synthesize_answer(user_input, sql_query, col_names, rows, model_name=model_name)
+            if rows or vector_chunks:
+                sql_chain.synthesize_answer(
+                    user_query=user_input,
+                    sql_query=sql_query or "N/A",
+                    col_names=col_names,
+                    rows=rows or [],
+                    vector_chunks=vector_chunks,
+                    model_name=model_name,
+                )
+            else:
+                print("No relevant information found across structured database or vector index.")
+
             print("-" * 65 + "\n")
 
         except (KeyboardInterrupt, EOFError):
