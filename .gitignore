@@ -18,6 +18,8 @@ __pycache__/
 venv/
 .venv/
 
+*.log
+
 # OS artifacts
 .DS_Store
 Thumbs.db
