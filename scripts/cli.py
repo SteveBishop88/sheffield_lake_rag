@@ -14,6 +14,7 @@ import sys
 import textwrap
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 # Optional vector search dependencies (graceful fallback if not installed/indexed yet)
@@ -59,7 +60,6 @@ class SheffieldSQLChain:
         oversample_factor: int = 5,
     ):
         """Retrieves semantically relevant unstructured text chunks using FAISS,
-
         applying post-filtering metadata checks for active CLI year ranges.
         """
         if not (self.embedder and self.vector_index and self.vector_metadata):
@@ -79,11 +79,9 @@ class SheffieldSQLChain:
                 if 0 <= idx < len(self.vector_metadata):
                     meta = self.vector_metadata[idx]
                     candidate_chunks.append(meta)
-                    # Track rowid or id for SQLite metadata fallback if year is missing in JSON
                     if isinstance(meta, dict) and "rowid" in meta:
                         rowids_to_lookup.append(meta["rowid"])
 
-            # Map SQLite meeting dates if vector metadata doesn't contain explicit parsed years
             db_date_map = {}
             if rowids_to_lookup and self.db_path.exists():
                 placeholders = ",".join("?" for _ in rowids_to_lookup)
@@ -99,7 +97,6 @@ class SheffieldSQLChain:
 
             filtered_results = []
             for chunk in candidate_chunks:
-                # Resolve date string from chunk dict or SQLite fallback
                 meeting_date = None
                 if isinstance(chunk, dict):
                     meeting_date = chunk.get("meeting_date") or chunk.get("date")
@@ -110,14 +107,12 @@ class SheffieldSQLChain:
                     if match:
                         meeting_date = match.group(0)
 
-                # Parse numeric year
                 parsed_year = None
                 if meeting_date:
                     year_match = re.search(r"\b(19|20)\d{2}\b", str(meeting_date))
                     if year_match:
                         parsed_year = int(year_match.group(0))
 
-                # Apply post-filtering criteria
                 if parsed_year is not None:
                     if start_year and parsed_year < start_year:
                         continue
@@ -134,28 +129,57 @@ class SheffieldSQLChain:
             print(f"\n[Warning: Vector retrieval failed]: {e}")
             return []
 
-    def get_all_distinct_issues(self):
-        if not self.db_path.exists():
-            return []
-
-        sql = """
-            SELECT 
-                fts.issue_type,
-                COUNT(*) as mention_count,
-                COALESCE(MIN(NULLIF(m.meeting_date, '')), 'Unknown') as earliest_date,
-                COALESCE(MAX(NULLIF(m.meeting_date, '')), 'Unknown') as latest_date,
-                fts.topic_name AS topic_name
-            FROM meetings_fts fts
-            JOIN meetings m ON fts.rowid = m.rowid
-            WHERE fts.issue_type IS NOT NULL AND fts.issue_type != ''
-            GROUP BY fts.issue_type, fts.topic_name
-            ORDER BY mention_count DESC, fts.issue_type ASC
+    def handle_issues_command(self, start_year: int = None, end_year: int = None):
+        """Executes a breakdown of all issue types in key_topics,
+        respecting active date filters if set.
         """
+        if not self.db_path.exists():
+            print("\nDatabase file not found.\n")
+            return
+
+        params = []
+        if start_year or end_year:
+            sql = """
+                SELECT k.issue_type, COUNT(*) as topic_count
+                FROM key_topics k
+                JOIN meetings m ON k.meeting_id = m.meeting_id
+                WHERE k.issue_type IS NOT NULL AND k.issue_type != ''
+            """
+            if start_year and end_year:
+                sql += " AND CAST(strftime('%Y', m.meeting_date) AS INTEGER) BETWEEN ? AND ?"
+                params.extend([start_year, end_year])
+            elif start_year:
+                sql += " AND CAST(strftime('%Y', m.meeting_date) AS INTEGER) >= ?"
+                params.append(start_year)
+            elif end_year:
+                sql += " AND CAST(strftime('%Y', m.meeting_date) AS INTEGER) <= ?"
+                params.append(end_year)
+
+            sql += " GROUP BY k.issue_type ORDER BY topic_count DESC;"
+        else:
+            sql = """
+                SELECT issue_type, COUNT(*) as topic_count
+                FROM key_topics
+                WHERE issue_type IS NOT NULL AND issue_type != ''
+                GROUP BY issue_type
+                ORDER BY topic_count DESC;
+            """
+
         with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute(sql)
-            return cursor.fetchall()
+            cursor.execute(sql, params)
+            results = cursor.fetchall()
+
+        if not results:
+            print("\nNo issue types found for the given criteria.\n")
+            return
+
+        print("\n================== ISSUE TYPE BREAKDOWN ==================")
+        print(f"{'Issue Type':<40} | {'Topics Count':<12}")
+        print("-" * 57)
+        for issue_type, count in results:
+            print(f"{issue_type:<40} | {count:<12}")
+        print("==========================================================\n")
 
     def get_database_schema(self):
         if not self.db_path.exists():
@@ -182,7 +206,7 @@ class SheffieldSQLChain:
 
         return schema_info
 
-    def retrieve_top_issues(self, limit: int = 10, start_year: int = None, end_year: int = None, category_filter: str = None):
+    def retrieve_top_issues(self, limit: int = 10, start_year: int = None, end_year: int = None, meeting_type_filter: str = None):
         if not self.db_path.exists():
             return []
 
@@ -194,7 +218,7 @@ class SheffieldSQLChain:
                 MIN(m.meeting_date) as earliest_date,
                 MAX(m.meeting_date) as latest_date
             FROM meetings_fts fts
-            JOIN meetings m ON fts.rowid = m.rowid
+            JOIN meetings m ON fts.rowid = m.meeting_id
             WHERE fts.issue_type IS NOT NULL AND fts.issue_type != ''
         """
         params = []
@@ -209,9 +233,9 @@ class SheffieldSQLChain:
             sql += " AND CAST(strftime('%Y', m.meeting_date) AS INTEGER) <= ?"
             params.append(end_year)
 
-        if category_filter:
-            sql += " AND m.category LIKE ?"
-            params.append(f"%{category_filter}%")
+        if meeting_type_filter:
+            sql += " AND LOWER(m.meeting_type) LIKE ?"
+            params.append(f"%{meeting_type_filter.lower()}%")
 
         sql += """
             GROUP BY fts.issue_type, fts.topic_name
@@ -226,36 +250,46 @@ class SheffieldSQLChain:
             cursor.execute(sql, params)
             return cursor.fetchall()
 
-    def generate_sql_query(self, user_query: str, limit: int = 20, start_year: int = None, end_year: int = None, category_filter: str = None, model_name: str = "llama3") -> str:
+    def generate_sql_query(self, user_query: str, limit: int = 20, start_year: int = None, end_year: int = None, meeting_type_filter: str = None, model_name: str = "llama3") -> str:
         """Uses Ollama to translate natural language into a single executable SQL query."""
         filter_context = []
         if start_year and end_year:
-            filter_context.append(f"m.meeting_date BETWEEN '{start_year}-01-01' AND '{end_year}-12-31'")
+            filter_context.append(f"CAST(strftime('%Y', m.meeting_date) AS INTEGER) BETWEEN {start_year} AND {end_year}")
         elif start_year:
-            filter_context.append(f"m.meeting_date >= '{start_year}-01-01'")
+            filter_context.append(f"CAST(strftime('%Y', m.meeting_date) AS INTEGER) >= {start_year}")
         elif end_year:
-            filter_context.append(f"m.meeting_date <= '{end_year}-12-31'")
+            filter_context.append(f"CAST(strftime('%Y', m.meeting_date) AS INTEGER) <= {end_year}")
 
-        if category_filter:
-            filter_context.append(f"m.category LIKE '%{category_filter}%'")
+        if meeting_type_filter:
+            clean_cat = meeting_type_filter.strip("'\"").lower()
+            filter_context.append(f"LOWER(m.meeting_type) LIKE '%{clean_cat}%'")
 
         filter_clause = (" AND " + " AND ".join(filter_context)) if filter_context else ""
+
+        schema_json = json.dumps(self.get_database_schema(), indent=2)
 
         prompt = f"""You are an expert SQLite generator for a municipal meeting database.
 Convert the user's natural language question into a single valid SQLite query.
 
 DATABASE SCHEMA:
-- Table 'meetings' (m): rowid, meeting_id, source_filename, meeting_date, category
-- Virtual Table 'meetings_fts' (fts): rowid, topic_name, description, issue_type
+{schema_json}
 
-CRITICAL SQL & FTS5 RULES:
-1. Always JOIN using: `FROM meetings m JOIN meetings_fts fts ON m.rowid = fts.rowid`
-2. For FTS full-text searches, match on the virtual table directly: `meetings_fts MATCH 'term*'`
-   NEVER write column-level match like `fts.topic_name MATCH`. Use `meetings_fts MATCH 'term*'` or `LIKE '%term%'`.
-3. Wrap multiple OR search predicates in explicit parentheses when combining with AND/date constraints:
-   Example: `WHERE (fts.topic_name LIKE '%barking%' OR fts.description LIKE '%barking%'){filter_clause}`
-4. Active date/category constraints (ALWAYS include these if non-empty): {filter_clause if filter_clause else 'None'}
-5. Always include `LIMIT {limit}` at the end of the query to constrain results.
+STRICT SQLITE & FTS5 RULES (DO NOT VIOLATE):
+1. NEVER use EXTRACT(YEAR FROM ...). SQLite DOES NOT support EXTRACT(). Always use CAST(strftime('%Y', m.meeting_date) AS INTEGER) for years.
+2. NEVER select ft.match_score or ft.matched_values. Standard SQLite FTS tables ONLY contain the indexed text columns and rowid.
+3. FTS MATCH SYNTAX: Always match against the table name directly: `meetings_fts MATCH 'roads OR drainage'`
+4. Always JOIN using: `FROM meetings m JOIN meetings_fts fts ON m.meeting_id = fts.rowid`
+5. Wrap multiple search predicates in explicit parentheses when combining with AND/date constraints.
+6. Active constraints (ALWAYS include these if non-empty): {filter_clause if filter_clause else 'None'}
+7. Always include `LIMIT {limit}` at the end of the query.
+8. Unless an active year filter is set or the user explicitly specifies a year/date in their query, DO NOT add year constraints (m.meeting_date LIKE ...) to the WHERE clause.
+
+CRITICAL FTS SYNTAX RULES:
+
+1. NEVER put fts.match in a SELECT statement. MATCH is NOT a column.
+2. NEVER use functional syntax like ft.match('query', 'table').
+3. ALWAYS use the infix syntax in the WHERE clause: meetings_fts MATCH 'term1 OR term2'
+4. To select the matched topic or column text, select the actual column names (e.g., fts.topic_name, fts.issue_type, fts.description).
 
 Output ONLY raw executable SQL starting with SELECT or WITH. Do NOT include markdown backticks or prose.
 
@@ -263,9 +297,15 @@ User Question: {user_query}
 
 SQLite Query:"""
 
+        req_data = {
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_ctx": 4096}
+        }
         req = urllib.request.Request(
             "http://localhost:11434/api/generate",
-            data=json.dumps({"model": model_name, "prompt": prompt, "stream": False}).encode("utf-8"),
+            data=json.dumps(req_data).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
         try:
@@ -273,7 +313,6 @@ SQLite Query:"""
                 res = json.loads(resp.read().decode("utf-8"))
                 raw_text = res.get("response", "").strip()
 
-                # Extract pure SQL block if wrapped in markdown code fence
                 sql_match = re.search(r"```(?:sql)?\s*(.*?)\s*```", raw_text, re.DOTALL | re.IGNORECASE)
                 if sql_match:
                     sql_str = sql_match.group(1).strip()
@@ -289,7 +328,6 @@ SQLite Query:"""
 
                 sql_str = sql_str.rstrip("`'\" ").strip()
 
-                # Fix FTS match syntax errors generated by models
                 sql_str = re.sub(r"\bfts\.\w+\s+MATCH\b", "meetings_fts MATCH", sql_str, flags=re.IGNORECASE)
                 sql_str = re.sub(r"\bfts\s+MATCH\b", "meetings_fts MATCH", sql_str, flags=re.IGNORECASE)
 
@@ -322,17 +360,38 @@ SQLite Query:"""
                 return None, []
 
     def synthesize_answer(self, user_query: str, sql_query: str, col_names: list, rows: list, vector_chunks: list = None, model_name: str = "llama3"):
+        # Deduplicate overlapping references between SQL rows and vector chunks
+        seen_rowids = set()
+        dedup_rows = []
+        for r in (rows or []):
+            try:
+                r_id = r["meeting_id"] if "meeting_id" in r.keys() else r["rowid"]
+                if r_id in seen_rowids:
+                    continue
+                seen_rowids.add(r_id)
+            except (KeyError, IndexError):
+                pass
+            dedup_rows.append(r)
+
+        dedup_chunks = []
+        for c in (vector_chunks or []):
+            if isinstance(c, dict) and "rowid" in c:
+                if c["rowid"] in seen_rowids:
+                    continue
+                seen_rowids.add(c["rowid"])
+            dedup_chunks.append(c)
+
         results_preview = []
-        for r in (rows or [])[:20]:
+        for r in dedup_rows[:20]:
             row_dict = {col: r[col] for col in col_names}
             results_preview.append(str(row_dict))
 
         data_str = "\n".join(results_preview) if results_preview else "No matching structured SQL rows returned."
-        total_rows = len(rows) if rows else 0
+        total_rows = len(dedup_rows)
 
         vector_context_str = ""
-        if vector_chunks:
-            chunk_texts = [f"- {c.get('text', str(c)) if isinstance(c, dict) else str(c)}" for c in vector_chunks]
+        if dedup_chunks:
+            chunk_texts = [f"- {c.get('text', str(c)) if isinstance(c, dict) else str(c)}" for c in dedup_chunks]
             vector_context_str = "\n\nRetrieved Unstructured Vector Context (RAG):\n" + "\n".join(chunk_texts)
 
         prompt = f"""You are an expert municipal analyst for the City of Sheffield Lake.
@@ -350,9 +409,15 @@ User Question: {user_query}
 
 Answer:"""
 
+        req_data = {
+            "model": model_name,
+            "prompt": prompt,
+            "stream": True,
+            "options": {"num_ctx": 4096}
+        }
         req = urllib.request.Request(
             "http://localhost:11434/api/generate",
-            data=json.dumps({"model": model_name, "prompt": prompt, "stream": True}).encode("utf-8"),
+            data=json.dumps(req_data).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
         try:
@@ -362,6 +427,8 @@ Answer:"""
                         chunk = json.loads(line.decode("utf-8"))
                         print(chunk.get("response", ""), end="", flush=True)
             print()
+        except urllib.error.URLError as e:
+            print(f"\n[Error: Could not connect to Ollama at localhost:11434]: {e}")
         except Exception as e:
             print(f"\n[Error calling Ollama synthesis]: {e}")
 
@@ -375,8 +442,11 @@ def print_banner():
     print("   /top [N]                  - Get top N overall issues via SQL count")
     print("   /issues                   - Data Check: Print distinct issue types & topics")
     print("   /schema                   - Data Check: Display tables, columns & row counts")
-    print("   /year <YYYY> or <YYYY-YYYY> - Set year or year range")
-    print("   /category <Name>          - Filter by category")
+    print("   /year <YYYY|YYYY-YYYY>    - Filter by year or year range (e.g. /year 2020-2024)")
+    print("   /type or /meeting_type    - Filter by meeting/committee type (e.g. /type Safety)")
+    print("                               Valid Types: Council, Safety, Roads_Drains, Finance,")
+    print("                                            Buildings_Lands, Ordinance, Planning, Zoning,")
+    print("                                            Administration, Public Works, Community Center, Park Board")
     print("   /model <Name>             - Set Ollama model (default: llama3)")
     print("   /chunks <N>               - Set result limit for list queries")
     print("   /clear                    - Reset active filters")
@@ -392,7 +462,7 @@ def run_cli():
 
     start_year = None
     end_year = None
-    category_filter = None
+    meeting_type_filter = None
     model_name = "llama3"
     n_results = 5
 
@@ -401,8 +471,8 @@ def run_cli():
             active = []
             if start_year or end_year:
                 active.append(f"Years:{start_year or 'Min'}-{end_year or 'Max'}")
-            if category_filter:
-                active.append(f"Cat:{category_filter}")
+            if meeting_type_filter:
+                active.append(f"Type:{meeting_type_filter}")
             filter_indicator = f" [{', '.join(active)}]" if active else ""
 
             user_input = input(f"Sheffield-SQL{filter_indicator}> ").strip()
@@ -415,7 +485,7 @@ def run_cli():
                 break
 
             elif cmd == "/clear":
-                start_year = end_year = category_filter = None
+                start_year = end_year = meeting_type_filter = None
                 print(">>> Filters cleared.\n")
                 continue
 
@@ -430,7 +500,7 @@ def run_cli():
                     limit=limit_val,
                     start_year=start_year,
                     end_year=end_year,
-                    category_filter=category_filter,
+                    meeting_type_filter=meeting_type_filter,
                 )
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
 
@@ -450,15 +520,7 @@ def run_cli():
                 continue
 
             elif cmd == "/issues":
-                rows = sql_chain.get_all_distinct_issues()
-                print(f"\n================ TOTAL DISTINCT ISSUES FOUND: {len(rows)} ================")
-                print(f"{'#':<4} | {'ISSUE TYPE':<22} | {'COUNT':<6} | {'DATE RANGE':<23} | {'TOPIC NAME'}")
-                print("-" * 90)
-                for idx, r in enumerate(rows, 1):
-                    date_range = f"{r['earliest_date']} to {r['latest_date']}"
-                    issue_type = (r["issue_type"][:19] + "...") if len(r["issue_type"]) > 22 else r["issue_type"]
-                    print(f"{idx:<4} | {issue_type:<22} | {r['mention_count']:<6} | {date_range:<23} | {r['topic_name']}")
-                print("===================================================================\n")
+                sql_chain.handle_issues_command(start_year=start_year, end_year=end_year)
                 continue
 
             elif cmd == "/schema":
@@ -484,11 +546,11 @@ def run_cli():
                     print(f">>> Year filter set to: {start_year} to {end_year}\n")
                 continue
 
-            elif cmd.startswith("/category"):
+            elif cmd.startswith("/meeting_type") or cmd.startswith("/type"):
                 parts = user_input.split(maxsplit=1)
                 if len(parts) > 1:
-                    category_filter = parts[1].strip()
-                    print(f">>> Category filter set to: '{category_filter}'\n")
+                    meeting_type_filter = parts[1].strip().strip("'\"")
+                    print(f">>> meeting_type filter set to: '{meeting_type_filter}'\n")
                 continue
 
             elif cmd.startswith("/model"):
@@ -509,7 +571,25 @@ def run_cli():
                 print("""
                 CLI Command Reference:
                 /year YYYY or YYYY-YYYY : Filter by year(s) (e.g., /year 2021-2024)
-                /category "Name"        : Filter by category (e.g., /category "Work Session")
+                /meeting_type "Name"    : Filter by meeting_type (e.g., /meeting_type "Work Session")
+                VALID MEETING TYPES TO QUERY:
+                • Council
+                • Safety
+                • Roads_Drains
+                • Buildings_Lands
+                • Finance
+                • Ordinance
+                • Planning
+                • Zoning
+                • Administration
+                • Public Works
+                • Community Center
+                • Park Board
+
+                QUERY GENERATION RULES FOR `meeting_type`:
+                - ALWAYS use `LOWER(m.meeting_type) LIKE '%<clean_keyword>%'` when filtering by meeting_type.
+                - REASON: DB records frequently contain compound pipe-delimited values (e.g. 'Safety | Council | Roads_Drains'). Exact equality (=) will fail.
+                
                 /chunks N               : Set result limit for list queries (e.g., /chunks 5)
                 /model model_name       : Change Ollama model (e.g., /model llama3)
                 /schema                 : Show database tables and counts
@@ -524,14 +604,14 @@ def run_cli():
 
             elif cmd == "/status":
                 year_str = f"{start_year}-{end_year}" if start_year and end_year else (str(start_year) if start_year else "None (All Years)")
-                cat_str = category_filter if category_filter else "None (All Categories)"
+                cat_str = meeting_type_filter if meeting_type_filter else "None (All Categories)"
 
                 status_output = f"""
                     ===================================================================
                                                 CURRENT CLI STATUS
                     ===================================================================
                     Active Year Filter     : {year_str}
-                    Active Category Filter : {cat_str}
+                    Active meeting_type Filter : {cat_str}
                     Result Limit (/chunks) : {n_results}
                     Ollama Model           : {model_name}
                     Vector Index Loaded    : {'Yes' if sql_chain.vector_index else 'No (SQL only)'}
@@ -541,14 +621,13 @@ def run_cli():
                 print()
                 continue
 
-            # Hybrid Execution Step 1: Text-to-SQL + Vector Search Concurrent Execution
             start_time = time.perf_counter()
             sql_query = sql_chain.generate_sql_query(
                 user_query=user_input,
                 limit=n_results,
                 start_year=start_year,
                 end_year=end_year,
-                category_filter=category_filter,
+                meeting_type_filter=meeting_type_filter,
                 model_name=model_name,
             )
 
@@ -559,7 +638,6 @@ def run_cli():
             else:
                 print(">>> Could not generate SQL query; falling back entirely to vector search.\n")
 
-            # Always-On Vector Search Retrieval with active year post-filtering
             vector_chunks = sql_chain.retrieve_vector_chunks(
                 query=user_input,
                 top_k=n_results,

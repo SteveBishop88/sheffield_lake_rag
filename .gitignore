@@ -23,3 +23,6 @@ venv/
 # OS artifacts
 .DS_Store
 Thumbs.db
+
+NEXT_SESSION_NOTES.md
+*.log

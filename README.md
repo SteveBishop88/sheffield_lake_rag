@@ -10,7 +10,10 @@ The system operates as a hybrid **Text-to-SQL + Vector RAG pipeline**, bringing 
 
 ## Data Pipeline Architecture
 
+```
 [Target Year Pages] ──> [Scraper] ──> [Raw PDFs] ──> [JSON Extraction] ──> [Data Cleaning] ──> [SQLite DB + FTS5] ──> [FAISS Vector Store] ──> [Text-to-SQL + RAG Workspace]
+```
+
 ### 1. Robust Web Scraping (`scripts/scraper.py` / `scripts/scraper2.py`)
 * **Target Array Architecture:** Eliminates crawler drift by mapping explicit multi-year landing pages (`2008-minutes` through `2026-minutes`).
 * **Two-Stage Fetch Pipeline:** Handles irregular WordPress structures by resolving direct `.pdf` links as well as intermediate HTML subpages containing embedded PDFs.
@@ -57,15 +60,71 @@ python scripts/build_fts_index.py
 
 # 6. Launch the interactive Text-to-SQL & RAG CLI workspace
 python scripts/cli.py
-Interactive CLI Workspace (scripts/cli.py)Launch the command-line workspace from the project root:Bashpython scripts/cli.py
-CLI Command ReferenceCommandUsage ExampleDescription/year/year 2021 or /year 2016-2021Restrict SQL and Vector search context to a specific year or date range/category/category "Work Session"Filter search context by committee/department type/chunks/chunks 5Control the number ($N$) of retrieved document records passed to Ollama/model/model llama3.1Switch the active local Ollama inference model on the fly/schema/schemaDisplay table definitions and record counts for the SQLite database/issues/issuesInspect aggregated issue types and topic counts/top/topShow top issue clusters via aggregated SQL queries/status/statusView active filter settings, context limits, and active model/clear/clearReset active year and category metadata filters/help/helpDisplay the interactive command menuexit / quitexitTerminate the CLI sessionGetting StartedPrerequisitesPython 3.11+Ollama running locally with your model of choice pulled:Bashollama pull llama3.1
-Setup InstructionsClone the Repository:Bashgit clone [https://github.com/SteveBishop88/sheffield_lake_rag.git](https://github.com/SteveBishop88/sheffield_lake_rag.git)
-cd sheffield_lake_rag
-Set Up Virtual Environment:Bashpython -m venv venv
-source venv/Scripts/activate  # On Windows Git Bash
-pip install -r requirements.txt
-Run the Interactive CLI:Bashpython scripts/cli.py
-Project Structuresheffield_lake_rag/
+```
+
+---
+
+## Interactive CLI Workspace (`scripts/cli.py`)
+
+Launch the command-line workspace from the project root:
+
+```bash
+python scripts/cli.py
+```
+
+### CLI Command Reference
+
+| Command | Usage Example | Description |
+|---|---|---|
+| `/year` | `/year 2021` or `/year 2016-2021` | Restrict SQL and Vector search context to a specific year or date range |
+| `/category` | `/category "Work Session"` | Filter search context by committee/department type |
+| `/chunks` | `/chunks 5` | Control the number ($N$) of retrieved document records passed to Ollama |
+| `/model` | `/model llama3.1` | Switch the active local Ollama inference model on the fly |
+| `/schema` | `/schema` | Display table definitions and record counts for the SQLite database |
+| `/issues` | `/issues` | Inspect aggregated issue types and topic counts |
+| `/top` | `/top` | Show top issue clusters via aggregated SQL queries |
+| `/status` | `/status` | View active filter settings, context limits, and active model |
+| `/clear` | `/clear` | Reset active year and category metadata filters |
+| `/help` | `/help` | Display the interactive command menu |
+| `exit` / `quit` | `exit` | Terminate the CLI session |
+
+---
+
+## Getting Started
+
+### Prerequisites
+* Python 3.11+
+* Ollama running locally with your model of choice pulled:
+  ```bash
+  ollama pull llama3.1
+  ```
+
+### Setup Instructions
+
+1. **Clone the Repository:**
+   ```bash
+   git clone https://github.com/SteveBishop88/sheffield_lake_rag.git
+   cd sheffield_lake_rag
+   ```
+
+2. **Set Up Virtual Environment:**
+   ```bash
+   python -m venv venv
+   source venv/Scripts/activate  # On Windows Git Bash
+   pip install -r requirements.txt
+   ```
+
+3. **Run the Interactive CLI:**
+   ```bash
+   python scripts/cli.py
+   ```
+
+---
+
+## Project Structure
+
+```
+sheffield_lake_rag/
 ├── data/                    # Local data artifacts (ignored by Git)
 │   ├── raw_pdfs/            # Downloaded municipal PDF records
 │   ├── extracted_json/      # Structured JSON files

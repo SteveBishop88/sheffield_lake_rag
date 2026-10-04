@@ -1,13 +1,6 @@
 # Creates and populates the SQLite FTS5 virtual table for sub-millisecond 
 # full-text search and keyword stemming across municipal meeting records.
 
-
-# Creates and populates the SQLite FTS5 virtual table for sub-millisecond 
-# full-text search and keyword stemming across municipal meeting records.
-
-# Creates and populates the SQLite FTS5 virtual table for sub-millisecond 
-# full-text search and keyword stemming across municipal meeting records.
-
 import sqlite3
 import time
 from pathlib import Path
@@ -33,12 +26,12 @@ def build_fts_index():
     cursor.execute("DROP TABLE IF EXISTS meetings_fts")
     print("\n[1/4] Dropped old meetings_fts virtual table (if present).")
 
-    # Step 2: Create the FTS5 Virtual Table using actual key_topics columns
+    # Step 2: Create the FTS5 Virtual Table using meeting_type
     cursor.execute("""
         CREATE VIRTUAL TABLE meetings_fts USING fts5(
             meeting_id UNINDEXED,
             source_filename,
-            category,
+            meeting_type,
             topic_name,
             description,
             issue_type,
@@ -50,11 +43,11 @@ def build_fts_index():
     # Step 3: Populate FTS5 table by joining meetings with key_topics
     start_time = time.perf_counter()
     cursor.execute("""
-        INSERT INTO meetings_fts(meeting_id, source_filename, category, topic_name, description, issue_type)
+        INSERT INTO meetings_fts(meeting_id, source_filename, meeting_type, topic_name, description, issue_type)
         SELECT 
             m.meeting_id,
             m.source_filename,
-            m.category,
+            m.meeting_type,
             t.topic_name,
             t.description,
             t.issue_type
